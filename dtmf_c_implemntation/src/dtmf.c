@@ -264,7 +264,8 @@ char* dtmf_decode_file(const char* filename, DTMFEncoder* encoder) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        printf("Usage: %s <encode|decode> <text|file> [output]\n", argv[0]);
+        printf("Usage: %s encode <text|->  [output]    (use - for stdin)\n", argv[0]);
+        printf("       %s decode <file>\n", argv[0]);
         return 1;
     }
     
@@ -276,10 +277,34 @@ int main(int argc, char** argv) {
     
     if (strcmp(argv[1], "encode") == 0) {
         const char* output = argc > 3 ? argv[3] : "output.wav";
-        if (dtmf_encode_string(encoder, argv[2], output) != 0) {
-            printf("Failed to encode string\n");
-            dtmf_destroy_encoder(encoder);
-            return 1;
+        
+        if (strcmp(argv[2], "-") == 0) {
+            // Read from stdin
+            char* buffer = NULL;
+            size_t bufsize = 0;
+            ssize_t chars_read;
+            
+            // Read entire line from stdin
+            if ((chars_read = getline(&buffer, &bufsize, stdin)) > 0) {
+                // Remove trailing newline if present
+                if (buffer[chars_read - 1] == '\n') {
+                    buffer[chars_read - 1] = '\0';
+                }
+                
+                if (dtmf_encode_string(encoder, buffer, output) != 0) {
+                    printf("Failed to encode string\n");
+                    free(buffer);
+                    dtmf_destroy_encoder(encoder);
+                    return 1;
+                }
+                free(buffer);
+            }
+        } else {
+            if (dtmf_encode_string(encoder, argv[2], output) != 0) {
+                printf("Failed to encode string\n");
+                dtmf_destroy_encoder(encoder);
+                return 1;
+            }
         }
     } else if (strcmp(argv[1], "decode") == 0) {
         char* decoded = dtmf_decode_file(argv[2], encoder);
