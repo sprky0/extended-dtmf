@@ -4,23 +4,17 @@ from scipy.io import wavfile
 import matplotlib.pyplot as plt
 
 class ExtendedDTMF:
-    """
-    Extended DTMF encoder/decoder supporting the full LATIN-1 character set.
-    
-    This class implements an extended version of the DTMF (Dual-Tone Multi-Frequency)
-    signaling system, expanding it to support all 256 characters of the LATIN-1 charset
-    using a 16x16 frequency grid.
-    """
-    
     def __init__(self):
         # Define frequency tables
         self.low_freqs = np.array([624 + i * 73 for i in range(16)])
         self.high_freqs = np.array([1209 + i * 127 for i in range(16)])
         
         # Audio parameters
-        self.sample_rate = 44100  # Hz
-        self.duration = 0.1       # seconds per character
-        self.amplitude = 0.3      # prevent clipping
+        self.sample_rate = 44100    # Hz
+        self.tone_duration = 0.05   # 50ms tone duration (standard DTMF)
+        self.pause_duration = 0.05  # 50ms interdigit pause
+        self.amplitude = 0.3        # prevent clipping
+        self.fade_ms = 5           # 5ms fade in/out to prevent clicking
         
         # FFT parameters
         self.fft_size = 4096
@@ -42,10 +36,32 @@ class ExtendedDTMF:
         return row * 16 + col
     
     def generate_tone(self, frequencies):
-        """Generate a tone with given frequencies."""
-        t = np.linspace(0, self.duration, int(self.sample_rate * self.duration))
+        """Generate a tone with given frequencies including fade in/out and pause."""
+        # Calculate samples for tone
+        tone_samples = int(self.sample_rate * self.tone_duration)
+        pause_samples = int(self.sample_rate * self.pause_duration)
+        fade_samples = int(self.sample_rate * (self.fade_ms / 1000))
+        
+        # Generate time array for the tone portion
+        t = np.linspace(0, self.tone_duration, tone_samples)
+        
+        # Generate the basic signal
         signal = np.sum([self.amplitude * np.sin(2 * np.pi * f * t) for f in frequencies], axis=0)
-        return signal
+        
+        # Create fade in/out envelope
+        fade_in = np.linspace(0, 1, fade_samples)
+        fade_out = np.linspace(1, 0, fade_samples)
+        fade_middle = np.ones(tone_samples - 2 * fade_samples)
+        envelope = np.concatenate([fade_in, fade_middle, fade_out])
+        
+        # Apply envelope
+        signal = signal * envelope
+        
+        # Add pause (silence)
+        silence = np.zeros(pause_samples)
+        
+        # Combine signal and pause
+        return np.concatenate([signal, silence])
     
     def detect_frequencies(self, audio_chunk):
         """Detect the strongest frequencies in an audio chunk using FFT."""
@@ -83,11 +99,13 @@ class ExtendedDTMF:
     def decode_signal(self, signal):
         """Decode an audio signal back into text."""
         decoded_text = ""
-        samples_per_char = int(self.sample_rate * self.duration)
+        samples_per_char = int(self.sample_rate * (self.tone_duration + self.pause_duration))
+        tone_samples = int(self.sample_rate * self.tone_duration)
         
         for i in range(0, len(signal), samples_per_char):
-            chunk = signal[i:i + samples_per_char]
-            if len(chunk) < samples_per_char/2:  # Skip incomplete chunks
+            # Only analyze the tone portion, ignore the pause
+            chunk = signal[i:i + tone_samples]
+            if len(chunk) < tone_samples/2:  # Skip incomplete chunks
                 break
                 
             low_freq, high_freq = self.detect_frequencies(chunk)
