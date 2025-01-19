@@ -35,3 +35,6 @@ htmlcov/
 
 # Build artifacts from our DTMF package
 src/extended_dtmf.egg-info/
+
+dtmv_c_implementation/dtmf
+
