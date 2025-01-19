@@ -5,9 +5,9 @@
 #include <stdio.h>
 
 #define SAMPLE_RATE 44100
-#define TONE_DURATION_MS 50
+#define TONE_DURATION_MS 100   // Increased duration for better detection
 #define PAUSE_DURATION_MS 50
-#define FADE_DURATION_MS 5
+#define FADE_DURATION_MS 10
 #define FFT_SIZE 4096
 #define FREQ_TOLERANCE 5.0
 
