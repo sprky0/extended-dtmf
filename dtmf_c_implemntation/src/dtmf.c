@@ -281,24 +281,40 @@ int main(int argc, char** argv) {
         if (strcmp(argv[2], "-") == 0) {
             // Read from stdin
             char* buffer = NULL;
-            size_t bufsize = 0;
-            ssize_t chars_read;
+            size_t total_size = 0;
+            size_t alloc_size = 1024;  // Start with 1KB
+            buffer = malloc(alloc_size);
             
-            // Read entire line from stdin
-            if ((chars_read = getline(&buffer, &bufsize, stdin)) > 0) {
-                // Remove trailing newline if present
-                if (buffer[chars_read - 1] == '\n') {
-                    buffer[chars_read - 1] = '\0';
-                }
-                
-                if (dtmf_encode_string(encoder, buffer, output) != 0) {
-                    printf("Failed to encode string\n");
-                    free(buffer);
-                    dtmf_destroy_encoder(encoder);
-                    return 1;
-                }
-                free(buffer);
+            if (!buffer) {
+                printf("Failed to allocate memory\n");
+                dtmf_destroy_encoder(encoder);
+                return 1;
             }
+            
+            int c;
+            while ((c = getchar()) != EOF) {
+                if (total_size + 1 >= alloc_size) {
+                    alloc_size *= 2;
+                    char* new_buffer = realloc(buffer, alloc_size);
+                    if (!new_buffer) {
+                        printf("Failed to reallocate memory\n");
+                        free(buffer);
+                        dtmf_destroy_encoder(encoder);
+                        return 1;
+                    }
+                    buffer = new_buffer;
+                }
+                buffer[total_size++] = (char)c;
+            }
+            buffer[total_size] = '\0';
+            
+            if (dtmf_encode_string(encoder, buffer, output) != 0) {
+                printf("Failed to encode string\n");
+                free(buffer);
+                dtmf_destroy_encoder(encoder);
+                return 1;
+            }
+            free(buffer);
         } else {
             if (dtmf_encode_string(encoder, argv[2], output) != 0) {
                 printf("Failed to encode string\n");
