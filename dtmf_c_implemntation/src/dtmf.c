@@ -55,7 +55,7 @@ static void write_wav_header(FILE* fp, uint32_t data_size) {
     fwrite(&header, sizeof(header), 1, fp);
 }
 
-// Implementation of public functions
+// Public function implementations
 DTMFEncoder* dtmf_create_encoder() {
     DTMFEncoder* encoder = malloc(sizeof(DTMFEncoder));
     if (!encoder) return NULL;
@@ -71,6 +71,7 @@ DTMFEncoder* dtmf_create_encoder() {
     encoder->tone_samples = (TONE_DURATION_MS * SAMPLE_RATE) / 1000;
     encoder->pause_samples = (PAUSE_DURATION_MS * SAMPLE_RATE) / 1000;
     encoder->fade_samples = (FADE_DURATION_MS * SAMPLE_RATE) / 1000;
+    encoder->verbose = 0; 
 
     return encoder;
 }
@@ -83,6 +84,12 @@ int dtmf_encode_char(DTMFEncoder* encoder, char c, float* buffer) {
     int code = (unsigned char)c;
     int row = code / 16;
     int col = code % 16;
+
+    // Debug output    
+    if (encoder->verbose) {
+        fprintf(stderr, "Encoding char '%c' (code: %d, hex: 0x%02x, row: %d, col: %d)\n", 
+                (code >= 32 && code < 127) ? c : '.', code, code, row, col);
+    }
     
     float low_freq = encoder->low_freqs[row];
     float high_freq = encoder->high_freqs[col];
@@ -112,6 +119,54 @@ int dtmf_encode_char(DTMFEncoder* encoder, char c, float* buffer) {
     }
     
     return total_samples;
+}
+
+char dtmf_decode_chunk(const float* buffer, int size, DTMFEncoder* encoder) {
+    float max_low_magnitude = 0;
+    float max_high_magnitude = 0;
+    int max_low_index = 0;
+    int max_high_index = 0;
+    float threshold = 0.1f;
+    
+    // Check each possible frequency
+    for (int i = 0; i < 16; i++) {
+        GoertzelState low_state, high_state;
+        
+        // Initialize Goertzel for both frequencies
+        goertzel_init(&low_state, encoder->low_freqs[i], encoder->sample_rate);
+        goertzel_init(&high_state, encoder->high_freqs[i], encoder->sample_rate);
+        
+        // Process the buffer
+        goertzel_process(&low_state, buffer, size);
+        goertzel_process(&high_state, buffer, size);
+        
+        // Get magnitudes
+        float low_mag = goertzel_magnitude(&low_state);
+        float high_mag = goertzel_magnitude(&high_state);
+        
+        if (low_mag > max_low_magnitude && low_mag > threshold) {
+            max_low_magnitude = low_mag;
+            max_low_index = i;
+        }
+        if (high_mag > max_high_magnitude && high_mag > threshold) {
+            max_high_magnitude = high_mag;
+            max_high_index = i;
+        }
+    }
+
+    // Special handling for control characters and spaces
+    unsigned char decoded = (unsigned char)(max_low_index * 16 + max_high_index);
+    if (decoded == 0x80) {  // If we detect what should be a space
+        decoded = ' ';
+    }
+
+    if (encoder->verbose) {
+        fprintf(stderr, "Decoded char '%c' (code: %d, hex: 0x%02x, low_mag: %.2f, high_mag: %.2f)\n",
+                (decoded >= 32 && decoded < 127) ? (char)decoded : '.',
+                decoded, decoded,
+                max_low_magnitude, max_high_magnitude);
+    }
+    return (char)decoded;
 }
 
 int dtmf_encode_string(DTMFEncoder* encoder, const char* text, const char* filename) {
@@ -147,43 +202,6 @@ int dtmf_encode_string(DTMFEncoder* encoder, const char* text, const char* filen
     free(buffer);
     fclose(fp);
     return 0;
-}
-
-char dtmf_decode_chunk(const float* buffer, int size, DTMFEncoder* encoder) {
-    float max_low_magnitude = 0;
-    float max_high_magnitude = 0;
-    int max_low_index = 0;
-    int max_high_index = 0;
-    
-    // Check each possible frequency
-    for (int i = 0; i < 16; i++) {
-        GoertzelState low_state, high_state;
-        
-        // Initialize Goertzel for both frequencies
-        goertzel_init(&low_state, encoder->low_freqs[i], encoder->sample_rate);
-        goertzel_init(&high_state, encoder->high_freqs[i], encoder->sample_rate);
-        
-        // Process the buffer
-        goertzel_process(&low_state, buffer, size);
-        goertzel_process(&high_state, buffer, size);
-        
-        // Get magnitudes
-        float low_mag = goertzel_magnitude(&low_state);
-        float high_mag = goertzel_magnitude(&high_state);
-        
-        // Update maximum if necessary
-        if (low_mag > max_low_magnitude) {
-            max_low_magnitude = low_mag;
-            max_low_index = i;
-        }
-        if (high_mag > max_high_magnitude) {
-            max_high_magnitude = high_mag;
-            max_high_index = i;
-        }
-    }
-    
-    // Convert indices to character
-    return (char)(max_low_index * 16 + max_high_index);
 }
 
 char* dtmf_decode_file(const char* filename, DTMFEncoder* encoder) {
@@ -262,18 +280,78 @@ char* dtmf_decode_file(const char* filename, DTMFEncoder* encoder) {
     return result;
 }
 
-int main(int argc, char** argv) {
-    if (argc < 3) {
-        printf("Usage: %s encode <text|->  [output]    (use - for stdin)\n", argv[0]);
-        printf("       %s decode <file>\n", argv[0]);
-        return 1;
+int dtmf_decode_file_stream(const char* filename, DTMFEncoder* encoder) {
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) return -1;
+    
+    // Read WAV header
+    WavHeader header;
+    if (fread(&header, sizeof(header), 1, fp) != 1) {
+        fclose(fp);
+        return -1;
     }
     
+    // Validate WAV format
+    if ((int)header.sample_rate != encoder->sample_rate ||
+        header.bits_per_sample != 16 ||
+        header.num_channels != 1) {
+        fclose(fp);
+        return -1;
+    }
+    
+    // Allocate buffer for one character duration
+    int samples_per_char = encoder->tone_samples;
+    float* buffer = malloc(samples_per_char * sizeof(float));
+    if (!buffer) {
+        fclose(fp);
+        return -1;
+    }
+    
+    // Read and decode chunks
+    int16_t sample;
+    int buffer_pos = 0;
+    
+    while (fread(&sample, sizeof(int16_t), 1, fp) == 1) {
+        // Convert to float
+        buffer[buffer_pos++] = sample / 32767.0f;
+        
+        if (buffer_pos == samples_per_char) {
+            // Decode chunk
+            char decoded = dtmf_decode_chunk(buffer, samples_per_char, encoder);
+            putchar(decoded);
+            fflush(stdout);  // Ensure immediate output
+            buffer_pos = 0;
+            
+            // Skip pause samples
+            fseek(fp, encoder->pause_samples * sizeof(int16_t), SEEK_CUR);
+        }
+    }
+    
+    free(buffer);
+    fclose(fp);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        printf("Usage: %s encode <text|->  [output]     (use - for stdin)\n", argv[0]);
+        printf("       %s decode <file> [--stream] [--verbose]    (--stream for real-time output)\n", argv[0]);
+        return 1;
+    }
+
     DTMFEncoder* encoder = dtmf_create_encoder();
     if (!encoder) {
         printf("Failed to initialize encoder\n");
         return 1;
     }
+
+    // Check for verbose flag
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--verbose") == 0) {
+            encoder->verbose = 1;
+            break;
+        }
+    }    
     
     if (strcmp(argv[1], "encode") == 0) {
         const char* output = argc > 3 ? argv[3] : "output.wav";
@@ -323,14 +401,25 @@ int main(int argc, char** argv) {
             }
         }
     } else if (strcmp(argv[1], "decode") == 0) {
-        char* decoded = dtmf_decode_file(argv[2], encoder);
-        if (!decoded) {
-            printf("Failed to decode file\n");
-            dtmf_destroy_encoder(encoder);
-            return 1;
+        int stream_mode = (argc > 3 && strcmp(argv[3], "--stream") == 0);
+        
+        if (stream_mode) {
+            if (dtmf_decode_file_stream(argv[2], encoder) != 0) {
+                printf("\nFailed to decode file\n");
+                dtmf_destroy_encoder(encoder);
+                return 1;
+            }
+            putchar('\n');  // Add final newline
+        } else {
+            char* decoded = dtmf_decode_file(argv[2], encoder);
+            if (!decoded) {
+                printf("Failed to decode file\n");
+                dtmf_destroy_encoder(encoder);
+                return 1;
+            }
+            printf("Decoded text: %s\n", decoded);
+            free(decoded);
         }
-        printf("Decoded text: %s\n", decoded);
-        free(decoded);
     }
     
     dtmf_destroy_encoder(encoder);

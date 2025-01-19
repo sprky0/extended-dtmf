@@ -37,6 +37,7 @@ typedef struct {
     int tone_samples;
     int pause_samples;
     int fade_samples;
+    int verbose;
 } DTMFEncoder;
 
 // Goertzel algorithm state
@@ -56,5 +57,6 @@ int dtmf_encode_char(DTMFEncoder* encoder, char c, float* buffer);
 char dtmf_decode_chunk(const float* buffer, int size, DTMFEncoder* encoder);
 int dtmf_encode_string(DTMFEncoder* encoder, const char* text, const char* filename);
 char* dtmf_decode_file(const char* filename, DTMFEncoder* encoder);
+int dtmf_decode_file_stream(const char* filename, DTMFEncoder* encoder);
 
 #endif // DTMF_H
