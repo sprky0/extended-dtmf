@@ -18,112 +18,161 @@ static void print_usage(const char *progname) {
     fprintf(stderr, "  encode    Convert bytes to DTMF audio\n");
     fprintf(stderr, "  decode    Convert DTMF audio back to bytes\n");
     fprintf(stderr, "  freqs     Display frequency tables and exit\n");
-    fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "\nOptions (must appear before command):\n");
     fprintf(stderr, "  -i FILE   Input file (default: stdin)\n");
     fprintf(stderr, "  -o FILE   Output file (default: stdout)\n");
     fprintf(stderr, "  -t TEXT   Input text string (alternative to -i)\n");
     fprintf(stderr, "  -v        Enable verbose output\n");
     fprintf(stderr, "  -s        Enable streaming mode (decode only)\n");
-    fprintf(stderr, "\nIf input/output files are omitted, uses standard input/output\n");
+    fprintf(stderr, "\nExamples:\n");
+    fprintf(stderr, "  %s -t \"Hello\" -o message.wav encode\n", progname);
+    fprintf(stderr, "  %s -i input.wav -o output.bin decode\n", progname);
+    fprintf(stderr, "  %s freqs\n", progname);
+}
+
+/* Structure to hold all command line options */
+typedef struct {
+    bool verbose;
+    bool stream;
+    const char *infile;
+    const char *outfile;
+    const char *text_input;
+    const char *command;
+} Options;
+
+/* Parse command line arguments */
+static int parse_options(int argc, char *argv[], Options *opts) {
+    int i = 1;
+    
+    /* Initialize options */
+    memset(opts, 0, sizeof(Options));
+    
+    /* Parse options first */
+    while (i < argc && argv[i][0] == '-') {
+        if (!strcmp(argv[i], "-v")) {
+            opts->verbose = true;
+        }
+        else if (!strcmp(argv[i], "-s")) {
+            opts->stream = true;
+        }
+        else if (!strcmp(argv[i], "-i")) {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: Missing argument for -i option\n");
+                return -1;
+            }
+            if (opts->text_input) {
+                fprintf(stderr, "Error: Cannot use both -i and -t options\n");
+                return -1;
+            }
+            opts->infile = argv[i];
+        }
+        else if (!strcmp(argv[i], "-o")) {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: Missing argument for -o option\n");
+                return -1;
+            }
+            opts->outfile = argv[i];
+        }
+        else if (!strcmp(argv[i], "-t")) {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: Missing argument for -t option\n");
+                return -1;
+            }
+            if (opts->infile) {
+                fprintf(stderr, "Error: Cannot use both -i and -t options\n");
+                return -1;
+            }
+            opts->text_input = argv[i];
+        }
+        else {
+            fprintf(stderr, "Error: Unknown option: %s\n", argv[i]);
+            return -1;
+        }
+        i++;
+    }
+    
+    /* Command must be the next argument */
+    if (i >= argc) {
+        fprintf(stderr, "Error: No command specified\n");
+        return -1;
+    }
+    
+    opts->command = argv[i++];
+    
+    /* No more arguments should remain */
+    if (i < argc) {
+        fprintf(stderr, "Error: Unexpected argument after command: %s\n", argv[i]);
+        return -1;
+    }
+    
+    /* Validate command */
+    if (strcmp(opts->command, "encode") && 
+        strcmp(opts->command, "decode") && 
+        strcmp(opts->command, "freqs")) {
+        fprintf(stderr, "Error: Unknown command: %s\n", opts->command);
+        return -1;
+    }
+    
+    /* Validate options */
+    if (opts->stream && strcmp(opts->command, "decode") == 0) {
+        fprintf(stderr, "Error: Streaming mode (-s) is only valid for decode command\n");
+        return -1;
+    }
+    
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
-    bool verbose = false;
-    bool stream = false;
-    int argIdx = 1;
-    const char *infile = NULL;
-    const char *outfile = NULL;
-    const char *text_input = NULL;
-    FILE *fin = stdin;   // Default to stdin
-    FILE *fout = stdout; // Default to stdout
+    Options opts;
+    FILE *fin = stdin;
+    FILE *fout = stdout;
+    int result;
     
-    /* Parse options */
-    while (argIdx < argc && argv[argIdx][0] == '-') {
-        if (!strcmp(argv[argIdx], "-v")) {
-            verbose = true;
-            argIdx++;
-        }
-        else if (!strcmp(argv[argIdx], "-s")) {
-            stream = true;
-            argIdx++;
-        }
-        else if (!strcmp(argv[argIdx], "-i")) {
-            if (++argIdx >= argc) {
-                fprintf(stderr, "Missing argument for -i option\n");
-                print_usage(argv[0]);
-                return 1;
-            }
-            infile = argv[argIdx++];
-        }
-        else if (!strcmp(argv[argIdx], "-o")) {
-            if (++argIdx >= argc) {
-                fprintf(stderr, "Missing argument for -o option\n");
-                print_usage(argv[0]);
-                return 1;
-            }
-            outfile = argv[argIdx++];
-        }
-        else if (!strcmp(argv[argIdx], "-t")) {
-            if (++argIdx >= argc) {
-                fprintf(stderr, "Missing argument for -t option\n");
-                print_usage(argv[0]);
-                return 1;
-            }
-            text_input = argv[argIdx++];
-            if (infile) {
-                fprintf(stderr, "Cannot specify both -i and -t options\n");
-                return 1;
-            }
-        }
-        else {
-            fprintf(stderr, "Unknown option: %s\n", argv[argIdx]);
-            print_usage(argv[0]);
-            return 1;
-        }
-    }
-    
-    /* Need at least the command */
-    if (argIdx >= argc) {
+    /* Show usage if no arguments */
+    if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
     
-    const char *command = argv[argIdx++];
+    /* Parse command line */
+    if (parse_options(argc, argv, &opts) != 0) {
+        print_usage(argv[0]);
+        return 1;
+    }
     
     /* Initialize DTMF system */
     if (dtmf_init() != 0) {
-        fprintf(stderr, "Failed to initialize DTMF system\n");
+        fprintf(stderr, "Error: Failed to initialize DTMF system\n");
         return 1;
     }
     
     /* Handle frequency dump command */
-    if (!strcmp(command, "freqs")) {
-        dtmf_dump_frequencies(stderr);  // Print to stderr since stdout might be binary
+    if (!strcmp(opts.command, "freqs")) {
+        dtmf_dump_frequencies(stderr);
         return 0;
     }
     
     /* Handle input source */
-    if (text_input) {
-        // Create a memory buffer for text input
-        fin = fmemopen((void*)text_input, strlen(text_input), "rb");
+    if (opts.text_input) {
+        fin = fmemopen((void*)opts.text_input, strlen(opts.text_input), "rb");
         if (!fin) {
-            fprintf(stderr, "Failed to create memory buffer for text input\n");
+            fprintf(stderr, "Error: Failed to create memory buffer for text input\n");
             return 1;
         }
     } 
-    else if (infile) {
-        fin = fopen(infile, "rb");
+    else if (opts.infile) {
+        fin = fopen(opts.infile, "rb");
         if (!fin) {
-            fprintf(stderr, "Cannot open input file: %s\n", infile);
+            fprintf(stderr, "Error: Cannot open input file: %s\n", opts.infile);
             return 1;
         }
     }
-
-    /* Open output file if specified */
-    if (outfile) {
-        fout = fopen(outfile, "wb");
+    
+    /* Handle output destination */
+    if (opts.outfile) {
+        fout = fopen(opts.outfile, "wb");
         if (!fout) {
-            fprintf(stderr, "Cannot open output file: %s\n", outfile);
+            fprintf(stderr, "Error: Cannot open output file: %s\n", opts.outfile);
             if (fin != stdin) {
                 fclose(fin);
             }
@@ -136,24 +185,21 @@ int main(int argc, char *argv[]) {
 #endif
     }
     
-    int result;
-    if (!strcmp(command, "encode")) {
-        result = dtmf_encode(fin, fout, verbose);
+    /* Process the command */
+    if (!strcmp(opts.command, "encode")) {
+        result = dtmf_encode(fin, fout, opts.verbose);
     }
-    else if (!strcmp(command, "decode")) {
-        result = dtmf_decode(fin, fout, verbose, stream);
-    }
-    else {
-        fprintf(stderr, "Unknown command: %s\n", command);
-        print_usage(argv[0]);
-        result = 1;
+    else {  /* decode */
+        result = dtmf_decode(fin, fout, opts.verbose, opts.stream);
     }
     
+    /* Cleanup */
     if (fin != stdin) {
         fclose(fin);
     }
     if (fout != stdout) {
         fclose(fout);
     }
+    
     return result;
 }

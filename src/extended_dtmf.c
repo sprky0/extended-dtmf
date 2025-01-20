@@ -47,6 +47,71 @@ static const double extendedCol[12] = {
 static double rowFreq[16];
 static double colFreq[16];
 
+/* ------------------ Audio Format Handling ------------------ */
+
+typedef struct {
+    int sample_rate;
+    int bits_per_sample;
+    int channels;
+    uint16_t audio_format;  // PCM = 1
+} WaveFormat;
+
+static WaveFormat detect_wave_format(const unsigned char *header, size_t size) {
+    WaveFormat fmt = {0};
+    
+    // Skip RIFF + size + WAVE (12 bytes)
+    const unsigned char *ptr = header + 12;
+    
+    // Find fmt chunk
+    while (ptr < header + size - 8) {
+        if (memcmp(ptr, "fmt ", 4) == 0) {
+            uint32_t chunk_size;
+            memcpy(&chunk_size, ptr + 4, 4);
+            ptr += 8;  // Skip chunk ID and size
+            
+            memcpy(&fmt.audio_format, ptr, 2);
+            memcpy(&fmt.channels, ptr + 2, 2);
+            memcpy(&fmt.sample_rate, ptr + 4, 4);
+            memcpy(&fmt.bits_per_sample, ptr + 14, 2);
+            break;
+        }
+        ptr += 8;  // Skip chunk ID and size
+        uint32_t chunk_size;
+        memcpy(&chunk_size, ptr - 4, 4);
+        ptr += chunk_size;  // Skip chunk data
+    }
+    
+    return fmt;
+}
+
+/* Simple linear interpolation resampler */
+static void resample_buffer(const int16_t* input, size_t input_len, 
+                          int16_t* output, size_t output_len, 
+                          int input_rate, int output_rate) {
+    double step = (double)input_rate / output_rate;
+    for (size_t i = 0; i < output_len; i++) {
+        double pos = i * step;
+        size_t pos_int = (size_t)pos;
+        double frac = pos - pos_int;
+        
+        if (pos_int >= input_len - 1) {
+            output[i] = input[input_len - 1];
+        } else {
+            output[i] = (int16_t)((1.0 - frac) * input[pos_int] + 
+                                 frac * input[pos_int + 1]);
+        }
+    }
+}
+
+/* Convert stereo to mono by averaging channels */
+static void stereo_to_mono(const int16_t* input, int16_t* output, size_t frames) {
+    for (size_t i = 0; i < frames; i++) {
+        int32_t left = input[i * 2];
+        int32_t right = input[i * 2 + 1];
+        output[i] = (int16_t)((left + right) / 2);
+    }
+}
+
 /* ------------------ Goertzel Algorithm ------------------ */
 
 typedef struct {
@@ -117,70 +182,99 @@ static void write_wav_header(FILE *out, int dataSize, bool verbose) {
     }
 }
 
-static long read_wav_header(FILE *in, bool verbose) {
-    char riffHeader[12];
-    if (fread(riffHeader, 1, 12, in) != 12) {
-        fprintf(stderr, "Error reading initial RIFF header.\n");
-        return -1;
-    }
-    if (memcmp(riffHeader, "RIFF", 4) != 0 || memcmp(riffHeader + 8, "WAVE", 4) != 0) {
-        fprintf(stderr, "Not a valid RIFF/WAVE file.\n");
+static long read_wav_header(FILE *in, int16_t **out_buffer, bool verbose) {
+    unsigned char header[44];  // Standard WAV header size
+    if (fread(header, 1, 44, in) != 44) {
+        fprintf(stderr, "Error reading WAV header\n");
         return -1;
     }
 
-    long dataSize = -1;
+    WaveFormat fmt = detect_wave_format(header, 44);
+    if (fmt.audio_format != 1) {  // Not PCM
+        fprintf(stderr, "Unsupported audio format (must be PCM)\n");
+        return -1;
+    }
 
+    if (fmt.bits_per_sample != 16) {
+        fprintf(stderr, "Unsupported bits per sample (must be 16-bit)\n");
+        return -1;
+    }
+
+    // Find data chunk and size
+    uint32_t data_size = 0;
     while (1) {
-        unsigned char chunkHeader[8];
-        if (fread(chunkHeader, 1, 8, in) != 8) {
-            fprintf(stderr, "Reached EOF without 'data' chunk.\n");
-            return -1;
-        }
-
-        uint32_t chunkSize;
-        memcpy(&chunkSize, chunkHeader + 4, 4);
-
-        if (!memcmp(chunkHeader, "fmt ", 4)) {
-            /* Verify format is compatible */
-            uint16_t format, channels, bits;
-            uint32_t rate;
-            
-            if (fread(&format, 2, 1, in) != 1 || format != 1 ||  /* PCM */
-                fread(&channels, 2, 1, in) != 1 || channels != 1 ||  /* Mono */
-                fread(&rate, 4, 1, in) != 1 || rate != DTMF_SAMPLE_RATE ||
-                fseek(in, 6, SEEK_CUR) != 0 ||  /* Skip byteRate and blockAlign */
-                fread(&bits, 2, 1, in) != 1 || bits != 16) {  /* 16-bit */
-                
-                fprintf(stderr, "Unsupported wave format (need: mono 16-bit PCM at %d Hz)\n",
-                        DTMF_SAMPLE_RATE);
-                return -1;
-            }
-            
-            /* Skip any extra format bytes */
-            if (chunkSize > 16) {
-                fseek(in, chunkSize - 16, SEEK_CUR);
-            }
-        }
-        else if (!memcmp(chunkHeader, "data", 4)) {
-            dataSize = chunkSize;
-            if (verbose) {
-                fprintf(stderr, "Found 'data' chunk (size=%ld)\n", dataSize);
-            }
+        char chunk_id[4];
+        if (fread(chunk_id, 1, 4, in) != 4) break;
+        
+        uint32_t chunk_size;
+        if (fread(&chunk_size, 4, 1, in) != 1) break;
+        
+        if (memcmp(chunk_id, "data", 4) == 0) {
+            data_size = chunk_size;
             break;
         }
-        else {
-            /* Skip unknown chunk */
-            if (verbose) {
-                char id[5];
-                memcpy(id, chunkHeader, 4);
-                id[4] = '\0';
-                fprintf(stderr, "Skipping chunk '%s' (%u bytes)\n", id, chunkSize);
-            }
-            fseek(in, chunkSize, SEEK_CUR);
-        }
+        
+        fseek(in, chunk_size, SEEK_CUR);
     }
 
-    return dataSize;
+    if (data_size == 0) {
+        fprintf(stderr, "No audio data found\n");
+        return -1;
+    }
+
+    // Read entire data chunk
+    size_t sample_count = data_size / (fmt.bits_per_sample / 8) / fmt.channels;
+    int16_t *raw_buffer = malloc(data_size);
+    if (!raw_buffer) {
+        fprintf(stderr, "Out of memory\n");
+        return -1;
+    }
+
+    if (fread(raw_buffer, 1, data_size, in) != data_size) {
+        fprintf(stderr, "Error reading audio data\n");
+        free(raw_buffer);
+        return -1;
+    }
+
+    // Handle conversion if needed
+    if (fmt.channels == 2) {
+        // Convert stereo to mono
+        int16_t *mono_buffer = malloc(sample_count * sizeof(int16_t));
+        if (!mono_buffer) {
+            fprintf(stderr, "Out of memory during stereo conversion\n");
+            free(raw_buffer);
+            return -1;
+        }
+        stereo_to_mono(raw_buffer, mono_buffer, sample_count);
+        free(raw_buffer);
+        raw_buffer = mono_buffer;
+    }
+
+    if (fmt.sample_rate != DTMF_SAMPLE_RATE) {
+        // Resample to target rate
+        size_t output_samples = (size_t)((double)sample_count * DTMF_SAMPLE_RATE / fmt.sample_rate);
+        int16_t *resampled_buffer = malloc(output_samples * sizeof(int16_t));
+        if (!resampled_buffer) {
+            fprintf(stderr, "Out of memory during resampling\n");
+            free(raw_buffer);
+            return -1;
+        }
+        
+        resample_buffer(raw_buffer, sample_count, 
+                       resampled_buffer, output_samples,
+                       fmt.sample_rate, DTMF_SAMPLE_RATE);
+        
+        free(raw_buffer);
+        raw_buffer = resampled_buffer;
+        sample_count = output_samples;
+    }
+
+    if (verbose) {
+        fprintf(stdout, "Read wave data\n");
+    }
+
+    *out_buffer = raw_buffer;
+    return sample_count * sizeof(int16_t);
 }
 
 /* ------------------ Encoding ------------------ */
@@ -378,8 +472,8 @@ int dtmf_encode(FILE *fin, FILE *fout, bool verbose) {
 }
 
 int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
-    /* Read wave header */
-    long dataSize = read_wav_header(fin, verbose);
+    int16_t *pcmData = NULL;
+    long dataSize = read_wav_header(fin, &pcmData, verbose);
     if (dataSize < 0) {
         return 1;
     }
@@ -390,27 +484,11 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
         return 0;
     }
 
-    /* Read all samples */
+    /* Calculate window information */
     long sampleCount = dataSize / sizeof(int16_t);
     long windowCount = sampleCount / WINDOW_SIZE;
     long remainder = sampleCount % WINDOW_SIZE;
     
-    if (verbose) {
-        fprintf(stderr, "Reading %ld samples from wave file...\n", sampleCount);
-    }
-
-    int16_t *pcmData = (int16_t *)malloc(dataSize);
-    if (!pcmData) {
-        fprintf(stderr, "Out of memory.\n");
-        return 1;
-    }
-    
-    if (fread(pcmData, sizeof(int16_t), sampleCount, fin) != (size_t)sampleCount) {
-        fprintf(stderr, "Short read on PCM data.\n");
-        free(pcmData);
-        return 1;
-    }
-
     if (verbose) {
         fprintf(stderr, "Processing %ld windows of %d samples", 
                 windowCount, WINDOW_SIZE);
@@ -435,6 +513,7 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
     const int MIN_SILENCE_WINDOWS = (int)(DTMF_GAP_DURATION * DTMF_SAMPLE_RATE / WINDOW_SIZE);
     const int MAX_SILENCE_WINDOWS = MIN_SILENCE_WINDOWS * 3;  // Allow for longer gaps
 
+    /* Process windows */
     for (long w = 0; w < windowCount; w++) {
         int16_t *windowPtr = &pcmData[w * WINDOW_SIZE];
         int bestRow, bestCol;
