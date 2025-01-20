@@ -30,8 +30,11 @@ The basic syntax is:
 
 - `-i FILE`: Specify input file (default: standard input)
 - `-o FILE`: Specify output file (default: standard output)
+- `-t TEXT`: Provide input text directly as a command-line argument
 - `-v`: Enable verbose output (shows progress and debugging information)
 - `-s`: Enable streaming mode (decode only - processes input in real-time)
+
+Note: The `-t` and `-i` options are mutually exclusive - you can only use one input source at a time.
 
 ### Examples
 
@@ -49,6 +52,11 @@ Use with pipes:
 ```bash
 cat input.bin | ./dtmf encode > output.wav
 cat input.wav | ./dtmf decode > output.bin
+
+Encode text directly:
+```bash
+./dtmf -t "Hello, World!" -o message.wav encode
+```
 ```
 
 Display frequency tables:

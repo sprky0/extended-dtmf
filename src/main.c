@@ -21,6 +21,7 @@ static void print_usage(const char *progname) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -i FILE   Input file (default: stdin)\n");
     fprintf(stderr, "  -o FILE   Output file (default: stdout)\n");
+    fprintf(stderr, "  -t TEXT   Input text string (alternative to -i)\n");
     fprintf(stderr, "  -v        Enable verbose output\n");
     fprintf(stderr, "  -s        Enable streaming mode (decode only)\n");
     fprintf(stderr, "\nIf input/output files are omitted, uses standard input/output\n");
@@ -32,6 +33,7 @@ int main(int argc, char *argv[]) {
     int argIdx = 1;
     const char *infile = NULL;
     const char *outfile = NULL;
+    const char *text_input = NULL;
     FILE *fin = stdin;   // Default to stdin
     FILE *fout = stdout; // Default to stdout
     
@@ -61,6 +63,18 @@ int main(int argc, char *argv[]) {
             }
             outfile = argv[argIdx++];
         }
+        else if (!strcmp(argv[argIdx], "-t")) {
+            if (++argIdx >= argc) {
+                fprintf(stderr, "Missing argument for -t option\n");
+                print_usage(argv[0]);
+                return 1;
+            }
+            text_input = argv[argIdx++];
+            if (infile) {
+                fprintf(stderr, "Cannot specify both -i and -t options\n");
+                return 1;
+            }
+        }
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[argIdx]);
             print_usage(argv[0]);
@@ -88,8 +102,16 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     
-    /* Open input file if specified */
-    if (infile) {
+    /* Handle input source */
+    if (text_input) {
+        // Create a memory buffer for text input
+        fin = fmemopen((void*)text_input, strlen(text_input), "rb");
+        if (!fin) {
+            fprintf(stderr, "Failed to create memory buffer for text input\n");
+            return 1;
+        }
+    } 
+    else if (infile) {
         fin = fopen(infile, "rb");
         if (!fin) {
             fprintf(stderr, "Cannot open input file: %s\n", infile);

@@ -13,7 +13,7 @@ BINDIR  := bin
 # Source files
 SRCS    := $(wildcard $(SRCDIR)/*.c)
 OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
-TARGET  := $(BINDIR)/extended_dtmf
+TARGET  := $(BINDIR)/dtmf
 
 # Create directories if they don't exist
 $(shell mkdir -p $(OBJDIR) $(BINDIR))
