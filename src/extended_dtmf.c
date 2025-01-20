@@ -229,10 +229,7 @@ static void encode_gap(FILE *out) {
 /* ------------------ Decoding ------------------ */
 
 
-static void detect_frequencies(const int16_t *samples,
-                       int *bestRow,   int *bestCol,
-                    double *rowMag, double *colMag) 
-{
+static void detect_frequencies(const int16_t *samples, int *bestRow,   int *bestCol, double *rowMag, double *colMag) {
     double maxRowMag = -1.0;
     double maxColMag = -1.0;
     int rowIdx = 0;
