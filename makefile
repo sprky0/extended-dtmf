@@ -1,41 +1,36 @@
-# Simple Makefile for building the extended DTMF CLI tool.
+# Makefile for extended DTMF encoder/decoder
 
 # Compiler and flags
 CC      := gcc
 CFLAGS  := -Wall -Wextra -O2
-LDFLAGS := -lm  # link math library for sin(), etc.
+LDFLAGS := -lm
 
 # Directories
 SRCDIR  := src
 OBJDIR  := obj
 BINDIR  := bin
 
-# Target program name
-TARGET  := extended_dtmf
+# Source files
+SRCS    := $(wildcard $(SRCDIR)/*.c)
+OBJS    := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+TARGET  := $(BINDIR)/extended_dtmf
 
-# Automatically gather all .c files in SRCDIR
-SOURCES := $(wildcard $(SRCDIR)/*.c)
-# Convert each .c to a corresponding .o under OBJDIR
-OBJECTS := $(patsubst $(SRCDIR)/%.c, $(OBJDIR)/%.o, $(SOURCES))
+# Create directories if they don't exist
+$(shell mkdir -p $(OBJDIR) $(BINDIR))
 
-# Default goal
-all: $(BINDIR)/$(TARGET)
+# Default target
+all: $(TARGET)
 
-# Link step
-$(BINDIR)/$(TARGET): $(OBJECTS)
-	@mkdir -p $(BINDIR)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo "Linking complete: $@"
+# Link
+$(TARGET): $(OBJS)
+	$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
-# Compile step
-$(OBJDIR)/%.o: $(SRCDIR)/%.c
-	@mkdir -p $(OBJDIR)
+# Compile
+$(OBJDIR)/%.o: $(SRCDIR)/%.c $(SRCDIR)/extended_dtmf.h
 	$(CC) $(CFLAGS) -c $< -o $@
-	@echo "Compiled: $< -> $@"
 
-# Clean up intermediate and final build artifacts
+# Clean
 clean:
 	rm -rf $(OBJDIR) $(BINDIR)
-	@echo "Cleaned."
 
 .PHONY: all clean

@@ -1,25 +1,6 @@
-# Python build artifacts
-*.py[cod]
-__pycache__/
-*.so
-build/
-dist/
-*.egg
-*.egg-info/
-src/*.egg-info/
-.eggs/
-
-# Virtual environments
-venv/
-env/
-.env/
-.venv/
-
-# Test artifacts
-.coverage
-coverage.xml
-.pytest_cache/
-htmlcov/
+# Build artifacts
+obj
+bin
 
 # IDE specific files
 .idea/
@@ -27,14 +8,8 @@ htmlcov/
 *.swp
 *.swo
 .DS_Store
+test.txt
+out.txt
 
 # Project specific
 *.wav
-*_analysis.png
-.python-version
-
-# Build artifacts from our DTMF package
-src/extended_dtmf.egg-info/
-
-dtmv_c_implementation/dtmf
-
