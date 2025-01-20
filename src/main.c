@@ -3,14 +3,17 @@
  * 
  * Command-line interface for extended DTMF encoding/decoding.
  */
-
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "extended_dtmf.h"
 
 static void print_usage(const char *progname) {
-    fprintf(stderr, "Usage: %s [options] <command> <input> <output>\n", progname);
+    fprintf(stderr, "Usage: %s [options] <command> <input> [output]\n", progname);
     fprintf(stderr, "\nCommands:\n");
     fprintf(stderr, "  encode    Convert bytes to DTMF audio\n");
     fprintf(stderr, "  decode    Convert DTMF audio back to bytes\n");
@@ -18,12 +21,14 @@ static void print_usage(const char *progname) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -v        Enable verbose output\n");
     fprintf(stderr, "  -s        Enable streaming mode (decode only)\n");
+    fprintf(stderr, "\nIf output file is omitted, writes to standard output\n");
 }
 
 int main(int argc, char *argv[]) {
     bool verbose = false;
     bool stream = false;
     int argIdx = 1;
+    FILE *fout = stdout;  // Default to stdout
     
     /* Parse options */
     while (argIdx < argc && argv[argIdx][0] == '-') {
@@ -41,13 +46,14 @@ int main(int argc, char *argv[]) {
         argIdx++;
     }
     
-    /* Need at least command */
-    if (argIdx >= argc) {
+    /* Need at least command and input file */
+    if (argIdx >= argc - 1) {
         print_usage(argv[0]);
         return 1;
     }
     
     const char *command = argv[argIdx++];
+    const char *infile = argv[argIdx++];
     
     /* Initialize DTMF system */
     if (dtmf_init() != 0) {
@@ -57,30 +63,30 @@ int main(int argc, char *argv[]) {
     
     /* Handle frequency dump command */
     if (!strcmp(command, "freqs")) {
-        dtmf_dump_frequencies(stdout);
+        dtmf_dump_frequencies(stderr);  // Print to stderr since stdout might be binary
         return 0;
     }
-    
-    /* All other commands need input/output files */
-    if (argIdx + 2 > argc) {
-        print_usage(argv[0]);
-        return 1;
-    }
-    
-    const char *infile = argv[argIdx++];
-    const char *outfile = argv[argIdx++];
     
     FILE *fin = fopen(infile, "rb");
     if (!fin) {
         fprintf(stderr, "Cannot open input file: %s\n", infile);
         return 1;
     }
-    
-    FILE *fout = fopen(outfile, "wb");
-    if (!fout) {
-        fprintf(stderr, "Cannot open output file: %s\n", outfile);
-        fclose(fin);
-        return 1;
+
+    /* If output file specified, open it */
+    if (argIdx < argc) {
+        const char *outfile = argv[argIdx];
+        fout = fopen(outfile, "wb");
+        if (!fout) {
+            fprintf(stderr, "Cannot open output file: %s\n", outfile);
+            fclose(fin);
+            return 1;
+        }
+    } else {
+        /* If using stdout for binary data, set binary mode if platform requires it */
+#ifdef _WIN32
+        _setmode(_fileno(stdout), _O_BINARY);
+#endif
     }
     
     int result;
@@ -97,6 +103,8 @@ int main(int argc, char *argv[]) {
     }
     
     fclose(fin);
-    fclose(fout);
+    if (fout != stdout) {
+        fclose(fout);
+    }
     return result;
 }

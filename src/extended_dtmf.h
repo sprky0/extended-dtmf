@@ -13,10 +13,11 @@
 
 /* Public configuration constants that might need adjustment */
 #define DTMF_SAMPLE_RATE     16000   /* Sample rate in Hz */
-#define DTMF_SYMBOL_DURATION 0.100   /* Duration per symbol when encoding (seconds) */
-#define DTMF_GAP_DURATION    0.015   /* Silence gap between symbols (seconds) */
+#define DTMF_SYMBOL_DURATION 0.500   /* Duration per symbol when encoding (seconds) */
+#define DTMF_GAP_DURATION    0.02   /* Silence gap between symbols (seconds) */
 #define DTMF_WINDOW_MS       20      /* Analysis window size for decoding (milliseconds) */
 #define DTMF_MIN_STABLE      2       /* Minimum stable windows before symbol is valid */
+#define DTMF_FADE_MS         5      /* Fade duration at start/end of each tone (milliseconds) */
 
 /* Public interface */
 

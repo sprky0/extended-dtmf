@@ -14,15 +14,15 @@
 
 /* Derived constants */
 #define SAMPLES_PER_SYMBOL ((int)(DTMF_SAMPLE_RATE * DTMF_SYMBOL_DURATION))
-#define GAP_SAMPLES       ((int)(DTMF_SAMPLE_RATE * DTMF_GAP_DURATION))
-#define WINDOW_SIZE       ((int)(DTMF_SAMPLE_RATE * DTMF_WINDOW_MS / 1000))
+#define GAP_SAMPLES        ((int)(DTMF_SAMPLE_RATE * DTMF_GAP_DURATION))
+#define WINDOW_SIZE        ((int)(DTMF_SAMPLE_RATE * DTMF_WINDOW_MS / 1000))
 
 /* Wave generation amplitude */
-#define AMPLITUDE         10000
+#define AMPLITUDE          10000
 
 /* Detection parameters */
-#define SILENCE_THRESHOLD 0.02
-#define MIN_MAG_RATIO    0.3    /* Minimum ratio between strongest/weakest tone */
+#define SILENCE_THRESHOLD  0.02
+#define MIN_MAG_RATIO      0.3    /* Minimum ratio between strongest/weakest tone */
 
 /* ------------------ Frequency Tables ------------------ */
 
@@ -188,6 +188,7 @@ static long read_wav_header(FILE *in, bool verbose) {
 static void encode_symbol(uint8_t byteVal, FILE *out) {
     int rowIndex = byteVal >> 4;   /* top nibble */
     int colIndex = byteVal & 0x0F; /* bottom nibble */
+    int fadeSamples = (int)(DTMF_SAMPLE_RATE * DTMF_FADE_MS / 1000.0);
 
     double f1 = rowFreq[rowIndex];
     double f2 = colFreq[colIndex];
@@ -197,6 +198,17 @@ static void encode_symbol(uint8_t byteVal, FILE *out) {
         double s1 = AMPLITUDE * sin(2.0 * M_PI * f1 * t);
         double s2 = AMPLITUDE * sin(2.0 * M_PI * f2 * t);
         double combined = s1 + s2;
+
+        /* Apply fade envelope */
+        double fadeMultiplier = 1.0;
+        if (n < fadeSamples) {
+            /* Fade in */
+            fadeMultiplier = (double)n / fadeSamples;
+        } else if (n > SAMPLES_PER_SYMBOL - fadeSamples) {
+            /* Fade out */
+            fadeMultiplier = (double)(SAMPLES_PER_SYMBOL - n) / fadeSamples;
+        }
+        combined *= fadeMultiplier;
 
         /* Clip to int16 range */
         if (combined > 32767.0)  combined = 32767.0;
@@ -266,7 +278,7 @@ static void detect_frequencies(const int16_t *samples,
 }
 
 static bool validate_tone(int row, int col, double rowMag, double colMag) {
-    /* Check magnitude ratio */
+    /* Check magnitude ratio between frequencies */
     double ratio = (rowMag < colMag) ? 
                   (rowMag / colMag) : 
                   (colMag / rowMag);
@@ -277,6 +289,11 @@ static bool validate_tone(int row, int col, double rowMag, double colMag) {
 
     /* Basic range validation */
     if (row < 0 || row >= 16 || col < 0 || col >= 16) {
+        return false;
+    }
+
+    /* Additional magnitude check - both tones should be strong enough */
+    if (rowMag < SILENCE_THRESHOLD || colMag < SILENCE_THRESHOLD) {
         return false;
     }
 
@@ -378,6 +395,9 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
 
     /* Read all samples */
     long sampleCount = dataSize / sizeof(int16_t);
+    long windowCount = sampleCount / WINDOW_SIZE;
+    long remainder = sampleCount % WINDOW_SIZE;
+    
     if (verbose) {
         fprintf(stderr, "Reading %ld samples from wave file...\n", sampleCount);
     }
@@ -387,15 +407,13 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
         fprintf(stderr, "Out of memory.\n");
         return 1;
     }
+    
     if (fread(pcmData, sizeof(int16_t), sampleCount, fin) != (size_t)sampleCount) {
         fprintf(stderr, "Short read on PCM data.\n");
         free(pcmData);
         return 1;
     }
 
-    /* Process windows */
-    long windowCount = sampleCount / WINDOW_SIZE;
-    long remainder = sampleCount % WINDOW_SIZE;
     if (verbose) {
         fprintf(stderr, "Processing %ld windows of %d samples", 
                 windowCount, WINDOW_SIZE);
@@ -405,42 +423,51 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
         fprintf(stderr, "\n");
     }
 
-    enum { STATE_SILENCE, STATE_TONE } state = STATE_SILENCE;
+    enum { 
+        STATE_SILENCE,    /* Waiting for a tone */
+        STATE_TONE,       /* Currently tracking a tone */
+        STATE_GAP         /* In a gap between tones */
+    } state = STATE_SILENCE;
+
     int currentRow = -1;
     int currentCol = -1;
     int stableCount = 0;
+    int silenceCount = 0;
     long symbolsDecoded = 0;
+    
+    const int MIN_SILENCE_WINDOWS = (int)(DTMF_GAP_DURATION * DTMF_SAMPLE_RATE / WINDOW_SIZE);
+    const int MAX_SILENCE_WINDOWS = MIN_SILENCE_WINDOWS * 3;  // Allow for longer gaps
 
     for (long w = 0; w < windowCount; w++) {
         int16_t *windowPtr = &pcmData[w * WINDOW_SIZE];
         int bestRow, bestCol;
         double rowMag, colMag;
-        
+
         detect_frequencies(windowPtr, &bestRow, &bestCol, &rowMag, &colMag);
 
-        /* Normalize magnitudes by window size */
+        /* Normalize magnitudes */
         rowMag /= WINDOW_SIZE;
         colMag /= WINDOW_SIZE;
         double totalMag = rowMag + colMag;
-
         bool isSilent = (totalMag < SILENCE_THRESHOLD);
 
-        if (verbose) {  /* Extra verbose for debugging */
-            fprintf(stderr, "Window %ld: row=%d col=%d rmag=%.3f cmag=%.3f %s\n",
+        if (verbose) {
+            fprintf(stderr, "Window %ld: row=%d col=%d rmag=%.3f cmag=%.3f %s state=%d stable=%d silence=%d\n",
                     w, bestRow, bestCol, rowMag, colMag,
-                    isSilent ? "(silent)" : "");
+                    isSilent ? "(silent)" : "", state, stableCount, silenceCount);
         }
 
         switch (state) {
             case STATE_SILENCE:
                 if (!isSilent && validate_tone(bestRow, bestCol, rowMag, colMag)) {
-                    /* Start tracking new tone */
+                    /* Found start of new tone */
                     currentRow = bestRow;
                     currentCol = bestCol;
                     stableCount = 1;
+                    silenceCount = 0;
                     state = STATE_TONE;
                     if (verbose) {
-                        fprintf(stderr, "Found new tone: row=%d col=%d\n",
+                        fprintf(stderr, "Found tone start: row=%d col=%d\n",
                                 currentRow, currentCol);
                     }
                 }
@@ -448,21 +475,25 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
 
             case STATE_TONE:
                 if (isSilent) {
-                    /* End of tone - finalize if stable */
-                    if (stableCount >= DTMF_MIN_STABLE) {
-                        finalize_symbol(fout, stream, verbose, currentRow, currentCol);
-                        symbolsDecoded++;
-                    } else if (verbose) {
-                        fprintf(stderr, "Ignoring unstable tone (%d windows)\n",
-                                stableCount);
+                    silenceCount++;
+                    if (silenceCount >= MIN_SILENCE_WINDOWS) {
+                        /* Enough silence to consider tone ended */
+                        if (stableCount >= DTMF_MIN_STABLE) {
+                            finalize_symbol(fout, stream, verbose, currentRow, currentCol);
+                            symbolsDecoded++;
+                        }
+                        state = STATE_GAP;
+                        if (verbose) {
+                            fprintf(stderr, "Enter gap after %d stable windows\n",
+                                    stableCount);
+                        }
                     }
-                    state = STATE_SILENCE;
-                    stableCount = 0;
                 } else if (validate_tone(bestRow, bestCol, rowMag, colMag)) {
+                    silenceCount = 0;  // Reset silence counter on valid tone
                     if (bestRow == currentRow && bestCol == currentCol) {
                         stableCount++;
                     } else {
-                        /* Tone change - finalize old if stable, start tracking new */
+                        /* Different tone detected */
                         if (stableCount >= DTMF_MIN_STABLE) {
                             finalize_symbol(fout, stream, verbose, currentRow, currentCol);
                             symbolsDecoded++;
@@ -477,10 +508,34 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
                     }
                 }
                 break;
+
+            case STATE_GAP:
+                if (!isSilent && validate_tone(bestRow, bestCol, rowMag, colMag)) {
+                    /* New tone after gap */
+                    currentRow = bestRow;
+                    currentCol = bestCol;
+                    stableCount = 1;
+                    silenceCount = 0;
+                    state = STATE_TONE;
+                    if (verbose) {
+                        fprintf(stderr, "Found tone after gap: row=%d col=%d\n",
+                                currentRow, currentCol);
+                    }
+                } else {
+                    silenceCount++;
+                    if (silenceCount > MAX_SILENCE_WINDOWS) {
+                        /* Extended silence, go back to initial state */
+                        state = STATE_SILENCE;
+                        if (verbose) {
+                            fprintf(stderr, "Extended silence, resetting\n");
+                        }
+                    }
+                }
+                break;
         }
     }
 
-    /* End of file - finalize last symbol if stable */
+    /* Handle final symbol if stable */
     if (state == STATE_TONE && stableCount >= DTMF_MIN_STABLE) {
         finalize_symbol(fout, stream, verbose, currentRow, currentCol);
         symbolsDecoded++;
@@ -493,7 +548,6 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream) {
 
     free(pcmData);
     return 0;
-
 }
 
 /* Helper function to dump frequency tables - useful for debugging */
