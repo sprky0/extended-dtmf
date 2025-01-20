@@ -9,6 +9,7 @@
  *   -e: Read raw bytes from file/stdin, encode them to a wave file of dual-tone signals.
  * Decoding:
  *   -d: Read a wave file of extended DTMF data, decode it back to raw bytes.
+ *       (Now uses variable-length tone detection, not fixed 50 ms chunks.)
  *
  * Usage:
  *   extended_dtmf [options]
@@ -17,11 +18,11 @@
  *     -i <file>      input file (defaults to stdin)
  *     -o <file>      output file (defaults to stdout)
  *     -v             verbose
- *     -r             real-time decode (flush output after each chunk)
+ *     -r             real-time decode (flush output after each byte)
  *     -h             help
  *
- * NOTE: This example uses naive signal generation and correlation-based detection.
- *       It is not robust against noise or drift but is sufficient as a demonstration.
+ * NOTE: This still uses naive signal generation and correlation-based detection.
+ *       It is not robust against noise, but is sufficient as a demonstration.
  */
 
 #include <stdio.h>
@@ -35,16 +36,41 @@
 /* ------------------ Configuration Constants ------------------ */
 
 /* Sample rate (Hz) */
-#define SAMPLE_RATE     8000
+#define SAMPLE_RATE     16000
 
-/* Duration (in seconds) per symbol (i.e., per byte) */
-#define SYMBOL_DURATION 0.05  /* 50 ms */
+/* Duration (in seconds) per symbol (i.e., per byte) when ENCODING */
+#define SYMBOL_DURATION 0.1  /* 50 ms */
 
-/* Number of samples per symbol */
+/* Number of samples per symbol (for ENCODING only) */
 #define SAMPLES_PER_SYMBOL  ((int)(SAMPLE_RATE * SYMBOL_DURATION))
 
 /* Amplitude for each tone (summed wave may clip if you pick large values) */
 #define AMPLITUDE 10000
+
+/*
+ * For DECODING, we use a smaller "analysis window" to detect stable tones of arbitrary length.
+ * For instance, 20 ms:
+ */
+#define WINDOW_MS   20
+#define WINDOW_SIZE (SAMPLE_RATE * WINDOW_MS / 1000)
+
+/*
+ * Number of consecutive windows that must match the same tone before we finalize a symbol.
+ * If each symbol is 50 ms, that's about 2.5 windows at 20 ms each, so '2' or '3' might work.
+ */
+#define MIN_STABLE_WINDOWS 2
+
+/*
+ * If the correlation magnitude is below this threshold, we consider it "silence" (no valid tone).
+ * Tweak as needed.
+ */
+#define SILENCE_THRESHOLD 0.02
+
+/* Duration of silence gap between characters (in seconds) */
+#define GAP_DURATION 0.015  /* 10 ms */
+
+/* Number of silence samples at 8 kHz */
+#define GAP_SAMPLES  ((int)(SAMPLE_RATE * GAP_DURATION))
 
 /* We have 16 possible row frequencies and 16 possible column frequencies,
    giving 256 unique pairs. For bytes 0..15, we match standard DTMF freq sets
@@ -52,12 +78,12 @@
 
 /* Standard DTMF row frequencies for row indices [0..3]: 697, 770, 852, 941 Hz */
 static double standardRow[4]  = {697.0,  770.0,  852.0,  941.0};
-/* Standard DTMF col frequencies for col indices [0..3]: 1209,1336,1477,1633 Hz */
+/* Standard DTMF col frequencies for col indices [0..3]: 1209, 1336, 1477, 1633 Hz */
 static double standardCol[4]  = {1209.0, 1336.0, 1477.0, 1633.0};
 
 /* Extended row frequencies for row indices [4..15]. Just pick some distinct ones. */
 static double extendedRow[12] = {
-    1000.0, 1060.0, 1120.0, 1180.0, 
+    1000.0, 1060.0, 1120.0, 1180.0,
     1240.0, 1300.0, 1360.0, 1420.0,
     1480.0, 1540.0, 1600.0, 1660.0
 };
@@ -69,60 +95,46 @@ static double extendedCol[12] = {
     2340.0, 2420.0, 2500.0, 2580.0
 };
 
-/* Row/Column frequency tables (16 each). We'll populate them at startup. */
+/* We'll fill these at runtime with row/column frequencies for [0..15]. */
 static double rowFreq[16];
 static double colFreq[16];
 
-/* ------------------ WAVE I/O Helpers ------------------ */
+/* ------------------ WAV I/O Helpers ------------------ */
 
 /*
- * Write a simple 44-byte WAV header for 16-bit PCM, 1 channel.
- * The 'dataSize' is the size in bytes of actual wave data that follows the header.
+ * Write a minimal 44-byte WAV header for 16-bit PCM, 1 channel.
+ * dataSize = the number of bytes of audio data that follows.
  */
 static void write_wav_header(FILE *out, int dataSize, bool verbose)
 {
-    /* Chunk sizes for a standard 44-byte header:
-     * - RIFF chunk:  36 + dataSize
-     * - fmt chunk:   16 bytes
-     * - data chunk:  dataSize
-     */
+    int overallSize = 36 + dataSize; /* for "RIFF" chunkSize field */
 
-    /* RIFF header */
-    int overallSize = 36 + dataSize; /* excludes "RIFF" itself which is 4 bytes */
     fwrite("RIFF", 1, 4, out);
-    /* 4-byte size field for entire file minus 8 bytes (we have "RIFF" + this size field) */
     uint32_t riffSize = (uint32_t)overallSize;
     fwrite(&riffSize, 4, 1, out);
 
-    /* WAVE format */
     fwrite("WAVE", 1, 4, out);
 
     /* fmt chunk */
     fwrite("fmt ", 1, 4, out);
-    uint32_t fmtChunkSize = 16;   /* size of the fmt chunk (PCM) */
+    uint32_t fmtChunkSize = 16;
     fwrite(&fmtChunkSize, 4, 1, out);
 
-    /* Audio format (1 = PCM) */
-    uint16_t audioFormat = 1;
+    uint16_t audioFormat = 1; /* PCM */
     fwrite(&audioFormat, 2, 1, out);
 
-    /* Num channels */
     uint16_t numChannels = 1;
     fwrite(&numChannels, 2, 1, out);
 
-    /* Sample rate */
     uint32_t sampleRate = SAMPLE_RATE;
     fwrite(&sampleRate, 4, 1, out);
 
-    /* Byte rate = sampleRate * numChannels * bitsPerSample/8 */
-    uint32_t byteRate = SAMPLE_RATE * numChannels * 2;
+    uint32_t byteRate = SAMPLE_RATE * numChannels * 2; /* 16-bit = 2 bytes */
     fwrite(&byteRate, 4, 1, out);
 
-    /* Block align = numChannels * bitsPerSample/8 */
     uint16_t blockAlign = numChannels * 2;
     fwrite(&blockAlign, 2, 1, out);
 
-    /* Bits per sample */
     uint16_t bitsPerSample = 16;
     fwrite(&bitsPerSample, 2, 1, out);
 
@@ -132,65 +144,32 @@ static void write_wav_header(FILE *out, int dataSize, bool verbose)
     fwrite(&dSize, 4, 1, out);
 
     if (verbose) {
-        fprintf(stderr, "WAV header written (dataSize=%d bytes)\n", dataSize);
+        fprintf(stderr, "WAV header written (dataSize=%d)\n", dataSize);
     }
 }
 
 /*
- * Read and parse a 44-byte WAV header. Returns the data size in bytes (payload),
- * or -1 on failure.
+ * A "robust" WAV header reader that skips unknown chunks until it finds "data".
+ * Returns size of the data chunk, or -1 on error.
  */
-// static long read_wav_header(FILE *in, bool verbose)
-// {
-//     unsigned char hdr[44];
-//     if (fread(hdr, 1, 44, in) != 44) {
-//         fprintf(stderr, "Error reading WAV header\n");
-//         return -1;
-//     }
-
-//     /* Basic checks */
-//     if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr+8, "WAVE", 4) != 0) {
-//         fprintf(stderr, "Not a valid RIFF/WAVE file.\n");
-//         return -1;
-//     }
-//     if (memcmp(hdr+12, "fmt ", 4) != 0) {
-//         fprintf(stderr, "Missing 'fmt ' chunk.\n");
-//         return -1;
-//     }
-//     if (memcmp(hdr+36, "data", 4) != 0) {
-//         fprintf(stderr, "Missing 'data' chunk.\n");
-//         return -1;
-//     }
-
-//     /* Extract data subchunk size (bytes) from the last 4 bytes of the header */
-//     uint32_t dataSize = 0;
-//     memcpy(&dataSize, hdr + 40, 4);
-
-//     if (verbose) {
-//         fprintf(stderr, "WAV header ok, dataSize=%u\n", dataSize);
-//     }
-//     return dataSize;
-// }
-
-static long robust_read_wav_header(FILE *in, bool verbose) {
+static long robust_read_wav_header(FILE *in, bool verbose)
+{
     char riffHeader[12];
     if (fread(riffHeader, 1, 12, in) != 12) {
         fprintf(stderr, "Error reading initial RIFF header.\n");
         return -1;
     }
-    if (memcmp(riffHeader, "RIFF", 4) != 0 || memcmp(riffHeader+8, "WAVE", 4) != 0) {
+    if (memcmp(riffHeader, "RIFF", 4) != 0 || memcmp(riffHeader + 8, "WAVE", 4) != 0) {
         fprintf(stderr, "Not a valid RIFF/WAVE file.\n");
         return -1;
     }
 
     long dataSize = -1;
-    // int gotFmt = 0; // Remove if unused
 
     while (1) {
-        // Read next chunk header
-        char chunkHeader[8];
+        unsigned char chunkHeader[8];
         if (fread(chunkHeader, 1, 8, in) != 8) {
-            // No more chunks
+            /* We reached EOF without finding data. */
             fprintf(stderr, "Reached EOF without 'data' chunk.\n");
             return -1;
         }
@@ -198,23 +177,19 @@ static long robust_read_wav_header(FILE *in, bool verbose) {
         uint32_t chunkSize;
         memcpy(&chunkSize, chunkHeader + 4, 4);
 
-        if (memcmp(chunkHeader, "fmt ", 4) == 0) {
-            // We found 'fmt ' chunk
-            // gotFmt = 1; // If you don't need this info, remove the variable entirely
-            // Read or skip
+        if (!memcmp(chunkHeader, "fmt ", 4)) {
+            /* skip or parse format chunk */
             fseek(in, chunkSize, SEEK_CUR);
         }
-        else if (memcmp(chunkHeader, "data", 4) == 0) {
-            // Found data chunk
+        else if (!memcmp(chunkHeader, "data", 4)) {
             dataSize = chunkSize;
             if (verbose) {
-                // Use "%ld" instead of "%u" because dataSize is a long
                 fprintf(stderr, "Found 'data' chunk (size=%ld)\n", dataSize);
             }
             break;
         }
         else {
-            // Some other chunk, skip it
+            /* skip unknown chunk */
             if (verbose) {
                 char id[5];
                 memcpy(id, chunkHeader, 4);
@@ -228,44 +203,51 @@ static long robust_read_wav_header(FILE *in, bool verbose) {
     return dataSize;
 }
 
-/* ------------------ Extended DTMF Encoding ------------------ */
+/* ------------------ Encoding (unchanged) ------------------ */
 
 /*
- * Generate SAMPLES_PER_SYMBOL of 16-bit audio data combining rowFreq + colFreq
- * for the given byte, and write to output.
+ * Generate SAMPLES_PER_SYMBOL of 16-bit audio data for the given byte
+ * (rowFreq[rowIndex], colFreq[colIndex]) and write to 'out'.
  */
 static void encode_symbol(uint8_t byteVal, FILE *out)
 {
-    int rowIndex = byteVal >> 4;       /* top nibble */
-    int colIndex = byteVal & 0x0F;     /* bottom nibble */
+    int rowIndex = byteVal >> 4;   /* top nibble */
+    int colIndex = byteVal & 0x0F; /* bottom nibble */
+
     double f1 = rowFreq[rowIndex];
     double f2 = colFreq[colIndex];
 
-    /* For each sample, we compute sum of two sines at f1 and f2. */
     for (int n = 0; n < SAMPLES_PER_SYMBOL; n++) {
         double t = (double)n / (double)SAMPLE_RATE;
+        double s1 = AMPLITUDE * sin(2.0 * M_PI * f1 * t);
+        double s2 = AMPLITUDE * sin(2.0 * M_PI * f2 * t);
+        double combined = s1 + s2; /* might be up to ±2*AMPLITUDE */
 
-        /* Simple sine wave: amplitude * sin(2*pi*freq*t) */
-        double sample1 = AMPLITUDE * sin(2.0 * M_PI * f1 * t);
-        double sample2 = AMPLITUDE * sin(2.0 * M_PI * f2 * t);
-
-        double combined = sample1 + sample2;  /* might get up to ±2*AMPLITUDE */
-
-        /* Clip to int16 range if needed. Very naive. */
+        /* Clip to int16 if needed. */
         if (combined > 32767.0)  combined = 32767.0;
         if (combined < -32768.0) combined = -32768.0;
 
-        int16_t pcm = (int16_t)(combined);
-        fwrite(&pcm, sizeof(int16_t), 1, out);
+        int16_t sample = (int16_t)combined;
+        fwrite(&sample, sizeof(int16_t), 1, out);
+    }
+}
+
+/**
+ * Generate a gap of silence (GAP_DURATION) between symbols.
+ */
+static void encode_gap(FILE *out)
+{
+    int16_t zero = 0;
+    for (int i = 0; i < GAP_SAMPLES; i++) {
+        fwrite(&zero, sizeof(int16_t), 1, out);
     }
 }
 
 /*
- * dtmf_encode(): reads all raw bytes from input, writes a wave file with extended DTMF tones.
+ * dtmf_encode(): read entire input, produce wave with one 50 ms symbol per byte.
  */
 int dtmf_encode(FILE *fin, FILE *fout, bool verbose)
 {
-    /* Read entire input into memory first */
     fseek(fin, 0, SEEK_END);
     long fsize = ftell(fin);
     if (fsize < 0) {
@@ -276,9 +258,8 @@ int dtmf_encode(FILE *fin, FILE *fout, bool verbose)
 
     if (fsize == 0) {
         if (verbose) {
-            fprintf(stderr, "No input data; encoding empty output.\n");
+            fprintf(stderr, "No input data; writing empty wave.\n");
         }
-        /* Write a valid wave with 0 data. */
         write_wav_header(fout, 0, verbose);
         return 0;
     }
@@ -288,58 +269,52 @@ int dtmf_encode(FILE *fin, FILE *fout, bool verbose)
         fprintf(stderr, "Out of memory.\n");
         return 1;
     }
+
     if (fread(buffer, 1, fsize, fin) != (size_t)fsize) {
-        fprintf(stderr, "Error reading input file.\n");
+        fprintf(stderr, "Error reading input.\n");
         free(buffer);
         return 1;
     }
 
-    /* Each byte -> SAMPLES_PER_SYMBOL * 2 bytes (16-bit) in wave data */
+    /* total wave bytes = (# of bytes) * (samples per symbol) * (2 bytes/sample) */
     long waveDataSize = fsize * (SAMPLES_PER_SYMBOL * sizeof(int16_t));
-
-    /* Write WAV header with placeholder for waveDataSize */
     write_wav_header(fout, waveDataSize, verbose);
 
-    /* Encode each byte as dual-tone chunk */
     for (long i = 0; i < fsize; i++) {
         encode_symbol(buffer[i], fout);
+        encode_gap(fout);
     }
 
     free(buffer);
+
     if (verbose) {
-        fprintf(stderr, "Encoded %ld bytes into wave data (%ld bytes of audio).\n",
-                fsize, waveDataSize);
+        fprintf(stderr, "Encoded %ld bytes -> %ld bytes of audio.\n", fsize, waveDataSize);
     }
     return 0;
 }
 
-/* ------------------ Extended DTMF Decoding ------------------ */
+/* ------------------ Decoding with Arbitrary-Length Tones ------------------ */
 
 /*
- * For decoding, we read the wave data in chunks of SAMPLES_PER_SYMBOL * 2 bytes.
- * We do a naive correlation against each possible row freq (16) and col freq (16).
- * We pick the row index & col index with the highest correlation magnitude.
- *
- * In a real design, you would do windowing, AGC, or FFT-based detection. This is a
- * simplistic approach that can work in an ideal scenario.
+ * We'll process the audio in short windows (WINDOW_SIZE samples) to see which
+ * row/col freq is strongest. Then we'll track stable (row,col) over multiple
+ * windows until we see a change or silence, finalizing that as one symbol.
  */
 
-/* Pre-generate reference signals for correlation.
- * For each of the 16 row frequencies, we store an array of SAMPLES_PER_SYMBOL samples.
- * Same for the 16 column frequencies.
- */
-static double rowRef[16][SAMPLES_PER_SYMBOL];
-static double colRef[16][SAMPLES_PER_SYMBOL];
+/* Correlation reference arrays for each row/col freq, sized for WINDOW_SIZE. */
+static double rowRef[16][WINDOW_SIZE];
+static double colRef[16][WINDOW_SIZE];
 
 /*
- * Build correlation references: rowRef[i][n] = sin(2*pi*rowFreq[i]*n/SAMPLE_RATE)
+ * Populate rowRef[i][n] with sin(2*pi*rowFreq[i]*t) for n in [0..WINDOW_SIZE-1].
+ * Same for colRef.
  */
-static void build_references(void)
+static void build_references_arbitrary(void)
 {
     for (int i = 0; i < 16; i++) {
         double fRow = rowFreq[i];
         double fCol = colFreq[i];
-        for (int n = 0; n < SAMPLES_PER_SYMBOL; n++) {
+        for (int n = 0; n < WINDOW_SIZE; n++) {
             double t = (double)n / (double)SAMPLE_RATE;
             rowRef[i][n] = sin(2.0 * M_PI * fRow * t);
             colRef[i][n] = sin(2.0 * M_PI * fCol * t);
@@ -347,50 +322,71 @@ static void build_references(void)
     }
 }
 
-/*
- * Perform naive correlation for row/col sets, pick the best match.
+/* Correlate the given 'window' (WINDOW_SIZE samples) against rowRef/colRef,
+ * return the best row & col index, plus a "magnitude" that indicates confidence.
  */
-static uint8_t decode_symbol(int16_t *samples)
+static void correlate_window(const int16_t *samples,
+                             int *bestRow, int *bestCol,
+                             double *bestMag)
 {
-    /* We want to see which rowRef and colRef yields the largest magnitude of dot product. */
-    double bestRowVal = -1e30;
-    double bestColVal = -1e30;
-    int    bestRowIdx = 0;
-    int    bestColIdx = 0;
+    double maxRowVal = -1e30;
+    double maxColVal = -1e30;
+    int rowIdx = 0;
+    int colIdx = 0;
 
-    /* Convert the incoming samples to double for correlation */
-    for (int rowIdx = 0; rowIdx < 16; rowIdx++) {
+    for (int r = 0; r < 16; r++) {
         double sum = 0.0;
-        for (int n = 0; n < SAMPLES_PER_SYMBOL; n++) {
-            /* scale to [-1..1], ignoring amplitude doubling from 2 tones */
-            double sampleVal = (double)samples[n] / 32768.0;
-            sum += sampleVal * rowRef[rowIdx][n];
+        for (int n = 0; n < WINDOW_SIZE; n++) {
+            double s = (double)samples[n] / 32768.0;
+            sum += s * rowRef[r][n];
         }
-        if (sum > bestRowVal) {
-            bestRowVal = sum;
-            bestRowIdx = rowIdx;
+        if (sum > maxRowVal) {
+            maxRowVal = sum;
+            rowIdx = r;
         }
     }
 
-    for (int colIdx = 0; colIdx < 16; colIdx++) {
+    for (int c = 0; c < 16; c++) {
         double sum = 0.0;
-        for (int n = 0; n < SAMPLES_PER_SYMBOL; n++) {
-            double sampleVal = (double)samples[n] / 32768.0;
-            sum += sampleVal * colRef[colIdx][n];
+        for (int n = 0; n < WINDOW_SIZE; n++) {
+            double s = (double)samples[n] / 32768.0;
+            sum += s * colRef[c][n];
         }
-        if (sum > bestColVal) {
-            bestColVal = sum;
-            bestColIdx = colIdx;
+        if (sum > maxColVal) {
+            maxColVal = sum;
+            colIdx = c;
         }
     }
 
-    /* Recombine to get the byte value = (rowIdx << 4) + colIdx */
-    return (uint8_t)((bestRowIdx << 4) | bestColIdx);
+    /* We'll define "magnitude" as the sum of the best row correlation + best column correlation. */
+    *bestRow = rowIdx;
+    *bestCol = colIdx;
+    *bestMag = maxRowVal + maxColVal;
 }
 
-/*
- * dtmf_decode(): read wave data in SAMPLES_PER_SYMBOL chunks, do correlation,
- *                output raw bytes. If real-time, flush after each.
+static void finalize_symbol(FILE *fout, bool stream, bool verbose, int row, int col)
+{
+    uint8_t symbol = (uint8_t)((row << 4) | col);
+
+    /* Write one byte to output */
+    fwrite(&symbol, 1, 1, fout);
+
+    /* Flush if real-time mode requested */
+    if (stream) {
+        fflush(fout);
+    }
+
+    if (verbose) {
+        fprintf(stderr, "Finalized symbol (row=%d, col=%d) => 0x%02X\n",
+                row, col, symbol);
+    }
+}
+
+/* dtmf_decode():
+ * 1) Read wave header -> total data size
+ * 2) Read entire PCM data
+ * 3) Process in short windows (WINDOW_SIZE)
+ * 4) Identify stable tone blocks as single symbols
  */
 int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream)
 {
@@ -400,47 +396,108 @@ int dtmf_decode(FILE *fin, FILE *fout, bool verbose, bool stream)
     }
     if (dataSize == 0) {
         if (verbose) {
-            fprintf(stderr, "No wave data to decode.\n");
+            fprintf(stderr, "No wave data.\n");
         }
         return 0;
     }
 
-    /* Make sure dataSize is multiple of SAMPLES_PER_SYMBOL * 2 bytes. */
-    long bytesPerSymbol = (SAMPLES_PER_SYMBOL * sizeof(int16_t));
-    long symbolCount = dataSize / bytesPerSymbol;
-    if ((dataSize % bytesPerSymbol) != 0) {
-        fprintf(stderr, "Warning: dataSize not multiple of %ld; ignoring leftover.\n",
-                bytesPerSymbol);
-        symbolCount = dataSize / bytesPerSymbol;  /* truncate */
-    }
+    long sampleCount = dataSize / (long)sizeof(int16_t);
     if (verbose) {
-        fprintf(stderr, "Decoding %ld symbols from wave...\n", symbolCount);
+        fprintf(stderr, "Reading %ld samples.\n", sampleCount);
     }
 
-    /* Buffer to hold each symbol's PCM samples. */
-    int16_t *symbolBuf = (int16_t *)malloc(bytesPerSymbol);
-    if (!symbolBuf) {
+    /* Read all the samples into memory */
+    int16_t *pcmData = (int16_t *)malloc(dataSize);
+    if (!pcmData) {
         fprintf(stderr, "Out of memory.\n");
         return 1;
     }
+    if (fread(pcmData, sizeof(int16_t), sampleCount, fin) != (size_t)sampleCount) {
+        fprintf(stderr, "Short read on PCM data.\n");
+        free(pcmData);
+        return 1;
+    }
 
-    for (long i = 0; i < symbolCount; i++) {
-        if (fread(symbolBuf, 1, bytesPerSymbol, fin) != (size_t)bytesPerSymbol) {
-            fprintf(stderr, "Short read on wave data.\n");
-            free(symbolBuf);
-            return 1;
-        }
-        uint8_t decodedByte = decode_symbol(symbolBuf);
-        fwrite(&decodedByte, 1, 1, fout);
-        if (stream) {
-            fflush(fout);
+    /* Now break into windows of WINDOW_SIZE. If there's leftover, ignore it. */
+    long windowCount = sampleCount / WINDOW_SIZE;
+    long remainder = sampleCount % WINDOW_SIZE;
+    if (verbose && remainder > 0) {
+        fprintf(stderr, "Ignoring %ld leftover samples (not a full window).\n", remainder);
+    }
+
+    /* We'll track a "current recognized tone" and see how many consecutive windows it persists. */
+    enum { STATE_SILENCE, STATE_TONE } state = STATE_SILENCE;
+    int currentRow = -1;
+    int currentCol = -1;
+    int stableCount = 0;
+
+    // /* Helper function to finalize a recognized tone as a single byte. */
+    // auto void finalize_symbol(int row, int col) {
+    //     uint8_t symbol = (uint8_t)((row << 4) | col);
+    //     fwrite(&symbol, 1, 1, fout);
+    //     if (stream) {
+    //         fflush(fout);
+    //     }
+    //     if (verbose) {
+    //         fprintf(stderr, "Finalized symbol (row=%d, col=%d) => 0x%02X\n",
+    //                 row, col, symbol);
+    //     }
+    // }
+
+    for (long w = 0; w < windowCount; w++) {
+        int16_t *windowPtr = &pcmData[w * WINDOW_SIZE];
+
+        int bestRow, bestCol;
+        double bestMag;
+        correlate_window(windowPtr, &bestRow, &bestCol, &bestMag);
+
+        /* Normalize by number of samples to compare to threshold. */
+        double normMag = bestMag / (double)WINDOW_SIZE;
+
+        bool isSilent = (fabs(normMag) < SILENCE_THRESHOLD);
+
+        switch (state) {
+            case STATE_SILENCE:
+                if (!isSilent) {
+                    /* Start tracking this new tone. */
+                    currentRow = bestRow;
+                    currentCol = bestCol;
+                    stableCount = 1;
+                    state = STATE_TONE;
+                }
+            break;
+
+            case STATE_TONE:
+                if (isSilent) {
+                    if (stableCount >= MIN_STABLE_WINDOWS) {
+                        finalize_symbol(fout, stream, verbose, currentRow, currentCol);
+                    }
+                    // transition to SILENCE, etc.
+                } else {
+                    if (bestRow == currentRow && bestCol == currentCol) {
+                        stableCount++;
+                    } else {
+                        if (stableCount >= MIN_STABLE_WINDOWS) {
+                            finalize_symbol(fout, stream, verbose, currentRow, currentCol);
+                        }
+                        currentRow = bestRow;
+                        currentCol = bestCol;
+                        stableCount = 1;
+                    }
+                }
+            break;
         }
     }
 
-    free(symbolBuf);
-    if (verbose) {
-        fprintf(stderr, "Decoded %ld symbols -> %ld bytes.\n", symbolCount, symbolCount);
+    /* End of file. If we ended in the TONE state, finalize if stable. */
+    // if (state == STATE_TONE && stableCount >= MIN_STABLE_WINDOWS) {
+    //     finalize_symbol(currentRow, currentCol);
+    // }
+    if (state == STATE_TONE && stableCount >= MIN_STABLE_WINDOWS) {
+        finalize_symbol(fout, stream, verbose, currentRow, currentCol);
     }
+
+    free(pcmData);
     return 0;
 }
 
@@ -452,7 +509,7 @@ static void print_usage(const char *progName)
         "Usage: %s [options]\n"
         "Options:\n"
         "  -e             Encode input (raw bytes) into extended DTMF wave\n"
-        "  -d             Decode extended DTMF wave back to raw bytes\n"
+        "  -d             Decode extended DTMF wave back to raw bytes (arbitrary tone length)\n"
         "  -i <file>      Input file (defaults to stdin)\n"
         "  -o <file>      Output file (defaults to stdout)\n"
         "  -v             Verbose\n"
@@ -462,18 +519,14 @@ static void print_usage(const char *progName)
     );
 }
 
-/*
- * Initialize the rowFreq[] and colFreq[] arrays for all 16 possible indexes.
- * Indices [0..3] = standard DTMF, indices [4..15] = extended sets.
- */
 static void init_frequencies(void)
 {
-    /* First 4 row/col frequencies from standard DTMF */
+    /* Fill rowFreq[0..3], colFreq[0..3] with standard DTMF */
     for (int i = 0; i < 4; i++) {
         rowFreq[i] = standardRow[i];
         colFreq[i] = standardCol[i];
     }
-    /* Next 12 from extended sets */
+    /* Fill rowFreq[4..15], colFreq[4..15] with extended sets */
     for (int i = 4; i < 16; i++) {
         rowFreq[i] = extendedRow[i - 4];
         colFreq[i] = extendedCol[i - 4];
@@ -483,7 +536,7 @@ static void init_frequencies(void)
 int main(int argc, char *argv[])
 {
     bool encode = false;
-    bool decode = false;
+    bool decodeFlag = false;
     bool verbose = false;
     bool realtime = false;
 
@@ -493,12 +546,24 @@ int main(int argc, char *argv[])
     int opt;
     while ((opt = getopt(argc, argv, "edi:o:vrh")) != -1) {
         switch (opt) {
-            case 'e': encode = true; break;
-            case 'd': decode = true; break;
-            case 'i': inputFile = optarg; break;
-            case 'o': outputFile = optarg; break;
-            case 'v': verbose = true; break;
-            case 'r': realtime = true; break;
+            case 'e':
+                encode = true;
+                break;
+            case 'd':
+                decodeFlag = true;
+                break;
+            case 'i':
+                inputFile = optarg;
+                break;
+            case 'o':
+                outputFile = optarg;
+                break;
+            case 'v':
+                verbose = true;
+                break;
+            case 'r':
+                realtime = true;
+                break;
             case 'h':
             default:
                 print_usage(argv[0]);
@@ -506,26 +571,24 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Must specify exactly one of -e or -d */
-    if ((encode && decode) || (!encode && !decode)) {
+    if ((encode && decodeFlag) || (!encode && !decodeFlag)) {
         fprintf(stderr, "Error: Must specify either -e or -d (but not both).\n");
         print_usage(argv[0]);
         return 1;
     }
 
-    /* Open files */
     FILE *fin = stdin;
     FILE *fout = stdout;
 
     if (inputFile) {
-        fin = fopen(inputFile, encode ? "rb" : "rb"); /* same for encode/decode */
+        fin = fopen(inputFile, "rb");
         if (!fin) {
             perror("fopen inputFile");
             return 1;
         }
     }
     if (outputFile) {
-        fout = fopen(outputFile, encode ? "wb" : "wb"); /* same for encode/decode */
+        fout = fopen(outputFile, "wb");
         if (!fout) {
             perror("fopen outputFile");
             if (fin != stdin) fclose(fin);
@@ -533,19 +596,21 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Build frequency tables */
+    /* Initialize rowFreq/colFreq arrays */
     init_frequencies();
 
-    /* Build correlation references (used only for decoding, but quick to do anyway) */
-    build_references();
-
-    /* Dispatch */
-    int ret = 0;
     if (encode) {
-        ret = dtmf_encode(fin, fout, verbose);
-    } else {
-        ret = dtmf_decode(fin, fout, verbose, realtime);
+        /* Just encode as before */
+        return dtmf_encode(fin, fout, verbose);
     }
+
+    /* decodeFlag = true => decode with new arbitrary-length tone approach */
+
+    /* Build references for short-window correlation */
+    build_references_arbitrary();
+
+    /* Decode */
+    int ret = dtmf_decode(fin, fout, verbose, realtime);
 
     if (fin && fin != stdin) fclose(fin);
     if (fout && fout != stdout) fclose(fout);
